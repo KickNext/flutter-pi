@@ -234,6 +234,7 @@ struct flutterpi {
         FlutterEngineAOTData aot_data;
 
         bool next_frame_request_is_secondary;
+        uint64_t next_frame_target_ns;
     } flutter;
 
     /// main event loop
@@ -532,6 +533,10 @@ UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
     FlutterEngineResult engine_result;
     struct flutterpi *flutterpi;
     struct frame_req *req;
+    const double refresh_rate;
+    uint64_t interval_ns;
+    uint64_t now_ns;
+    uint64_t target_ns;
     int ok;
 
     ASSERT_NOT_NULL(userdata);
@@ -547,8 +552,34 @@ UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
 
     req->flutterpi = flutterpi;
     req->baton = baton;
-    req->vblank_ns = get_monotonic_time();
-    req->next_vblank_ns = req->vblank_ns + (1000000000.0 / compositor_get_refresh_rate(flutterpi->compositor));
+
+    refresh_rate = compositor_get_refresh_rate(flutterpi->compositor);
+    interval_ns = (uint64_t) llround(1000000000.0 / refresh_rate);
+    if (interval_ns == 0) {
+        interval_ns = 16666667ull;
+    }
+
+    now_ns = get_monotonic_time();
+    target_ns = flutterpi->flutter.next_frame_target_ns;
+    if (target_ns == 0 || now_ns > target_ns + interval_ns * 4) {
+        target_ns = now_ns;
+    }
+
+    if (now_ns < target_ns) {
+        struct timespec sleep_ts = {
+            .tv_sec = (time_t) (target_ns / 1000000000ull),
+            .tv_nsec = (long) (target_ns % 1000000000ull),
+        };
+
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &sleep_ts, NULL) == EINTR) {
+        }
+
+        now_ns = get_monotonic_time();
+    }
+
+    req->vblank_ns = now_ns;
+    req->next_vblank_ns = now_ns + interval_ns;
+    flutterpi->flutter.next_frame_target_ns = req->next_vblank_ns;
 
     if (flutterpi_runs_platform_tasks_on_current_thread(req->flutterpi)) {
         TRACER_INSTANT(req->flutterpi->tracer, "FlutterEngineOnVsync");
@@ -1349,7 +1380,7 @@ static FlutterEngine create_flutter_engine(
     project_args.update_semantics_custom_action_callback = NULL;
     project_args.persistent_cache_path = paths->asset_bundle_path;
     project_args.is_persistent_cache_read_only = false;
-    project_args.vsync_callback = NULL;  // on_frame_request, /* broken since 2.2, kinda *
+    project_args.vsync_callback = getenv("FLUTTER_PI_SOFTWARE_VSYNC") != NULL ? on_frame_request : NULL;
     project_args.custom_dart_entrypoint = NULL;
     project_args.custom_task_runners = &custom_task_runners;
     project_args.shutdown_dart_vm_when_done = true;
@@ -2537,6 +2568,17 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     }
 
     if (cmd_args.dummy_display) {
+        const char *dummy_refresh_rate_env = getenv("FLUTTER_PI_DUMMY_REFRESH_RATE");
+        double dummy_refresh_rate = 60.0;
+
+        if (dummy_refresh_rate_env != NULL) {
+            char *endptr = NULL;
+            double parsed = strtod(dummy_refresh_rate_env, &endptr);
+            if (endptr != dummy_refresh_rate_env && parsed > 0.0 && isfinite(parsed)) {
+                dummy_refresh_rate = parsed;
+            }
+        }
+
         window = dummy_window_new(
             tracer,
             scheduler,
@@ -2547,7 +2589,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
             cmd_args.has_physical_dimensions,
             cmd_args.physical_dimensions.x,
             cmd_args.physical_dimensions.y,
-            60.0
+            dummy_refresh_rate
         );
     } else {
         window = kms_window_new(
