@@ -533,7 +533,6 @@ UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
     FlutterEngineResult engine_result;
     struct flutterpi *flutterpi;
     struct frame_req *req;
-    const double refresh_rate;
     uint64_t interval_ns;
     uint64_t now_ns;
     uint64_t target_ns;
@@ -553,8 +552,7 @@ UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
     req->flutterpi = flutterpi;
     req->baton = baton;
 
-    refresh_rate = compositor_get_refresh_rate(flutterpi->compositor);
-    interval_ns = (uint64_t) llround(1000000000.0 / refresh_rate);
+    interval_ns = (uint64_t) llround(1000000000.0 / compositor_get_refresh_rate(flutterpi->compositor));
     if (interval_ns == 0) {
         interval_ns = 16666667ull;
     }
