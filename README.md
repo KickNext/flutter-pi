@@ -410,6 +410,36 @@ of the flutter app you're trying to run.
 
 `[flutter engine options...]` will be passed as commandline arguments to the flutter engine. You can find a list of commandline options for the flutter engine [Here](https://github.com/flutter/engine/blob/master/shell/common/switches.h).
 
+#### Optional fbdev mirror for dummy or secondary outputs
+
+When you need to render through GBM/EGL but also copy the presented frame into a
+secondary framebuffer device, set:
+
+```bash
+export FLUTTER_PI_FBDEV_MIRROR=/dev/fb1
+```
+
+This mirrors the presented GBM buffer into the selected fbdev target.
+
+- The target framebuffer layout is detected from `FBIOGET_VSCREENINFO`; it is
+  not hardcoded to `RGB565`.
+- Packed `FB_VISUAL_TRUECOLOR` and `FB_VISUAL_DIRECTCOLOR` targets up to `32`
+  bits per pixel are supported.
+- Matching source/target pixel formats use a direct row copy fast path.
+- `ARGB8888`/`XRGB8888` to `RGB565` uses a dedicated fast path because it is a
+  common embedded-panel case.
+- Other supported layouts fall back to generic per-pixel channel conversion
+  based on the fbdev bitfields.
+- The visible fbdev resolution must match the render surface resolution.
+- The mirror path currently requires linear GBM buffers.
+
+For dummy-display setups this usually means launching flutter-pi with
+`FLUTTER_PI_DUMMY_LINEAR=1`, for example:
+
+```bash
+FLUTTER_PI_DUMMY_LINEAR=1 FLUTTER_PI_FBDEV_MIRROR=/dev/fb1 flutter-pi --dummy-display --dummy-display-size 240,240 --release /home/pi/my_app
+```
+
 ### gstreamer video player
 Gstreamer video player is a newer video player based on gstreamer.
 

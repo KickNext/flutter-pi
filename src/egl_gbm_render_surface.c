@@ -81,21 +81,153 @@ static const uuid_t uuid = CONST_UUID(0xf9, 0xc2, 0x5d, 0xad, 0x2e, 0x3b, 0x4e, 
 #define CAST_THIS_UNCHECKED(ptr) CAST_EGL_GBM_RENDER_SURFACE_UNCHECKED(ptr)
 
 struct fbdev_mirror {
-    bool initialized;
     bool enabled;
+    bool has_target_pixfmt;
     bool logged_unsupported_format;
     bool logged_unsupported_modifier;
+    bool logged_size_mismatch;
+    uint32_t retry_after_frames;
     int fd;
     uint8_t *map;
     size_t map_size;
     uint32_t width;
     uint32_t height;
     uint32_t stride;
+    uint32_t bytes_per_pixel;
+    size_t base_offset;
+    struct fbdev_pixfmt target_format;
+    enum pixfmt target_pixfmt;
 };
 
 static struct fbdev_mirror g_fbdev_mirror = {
     .fd = -1,
 };
+
+static inline uint64_t bitfield_mask(uint32_t length) {
+    if (length == 0) {
+        return 0;
+    }
+
+    if (length >= 64) {
+        return UINT64_MAX;
+    }
+
+    return (UINT64_C(1) << length) - 1;
+}
+
+static inline uint8_t bitfield_to_u8(uint32_t value, uint32_t length) {
+    uint64_t max_value;
+
+    if (length == 0) {
+        return 0;
+    }
+
+    max_value = bitfield_mask(length);
+    return (uint8_t) (((uint64_t) value * 255 + (max_value / 2)) / max_value);
+}
+
+static inline uint32_t u8_to_bitfield(uint8_t value, uint32_t length) {
+    uint64_t max_value;
+
+    if (length == 0) {
+        return 0;
+    }
+
+    max_value = bitfield_mask(length);
+    return (uint32_t) ((((uint64_t) value * max_value) + 127) / 255);
+}
+
+static bool fbdev_mirror_validate_bitfield(
+    const char *path,
+    const char *name,
+    struct fb_bitfield field,
+    uint32_t bits_per_pixel,
+    uint64_t *used_bits_inout,
+    bool required
+) {
+    uint64_t mask;
+
+    if (field.msb_right != 0) {
+        LOG_ERROR(
+            "fbdev mirror target %s uses unsupported %s bitfield with msb_right=%u.\n",
+            path,
+            name,
+            field.msb_right
+        );
+        return false;
+    }
+
+    if (field.length == 0) {
+        if (required) {
+            LOG_ERROR("fbdev mirror target %s has no %s channel.\n", path, name);
+            return false;
+        }
+
+        return true;
+    }
+
+    if (field.offset >= bits_per_pixel || field.length > bits_per_pixel || field.offset + field.length > bits_per_pixel) {
+        LOG_ERROR(
+            "fbdev mirror target %s has invalid %s bitfield offset/length (%u/%u) for %u bpp.\n",
+            path,
+            name,
+            field.offset,
+            field.length,
+            bits_per_pixel
+        );
+        return false;
+    }
+
+    mask = bitfield_mask(field.length) << field.offset;
+    if ((*used_bits_inout & mask) != 0) {
+        LOG_ERROR("fbdev mirror target %s has overlapping %s bitfield.\n", path, name);
+        return false;
+    }
+
+    *used_bits_inout |= mask;
+    return true;
+}
+
+static inline uint32_t read_packed_pixel(const uint8_t *src, uint32_t bytes_per_pixel) {
+    uint32_t pixel;
+
+    pixel = 0;
+    memcpy(&pixel, src, bytes_per_pixel);
+    return pixel;
+}
+
+static inline void write_packed_pixel(uint8_t *dst, uint32_t bytes_per_pixel, uint32_t pixel) {
+    memcpy(dst, &pixel, bytes_per_pixel);
+}
+
+struct rgba8 {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t a;
+};
+
+static inline struct rgba8 unpack_pixfmt_pixel(uint32_t pixel, const struct fbdev_pixfmt *format) {
+    struct rgba8 rgba = {
+        .r = format->r.length == 0 ? 0 : bitfield_to_u8((pixel >> format->r.offset) & bitfield_mask(format->r.length), format->r.length),
+        .g = format->g.length == 0 ? 0 : bitfield_to_u8((pixel >> format->g.offset) & bitfield_mask(format->g.length), format->g.length),
+        .b = format->b.length == 0 ? 0 : bitfield_to_u8((pixel >> format->b.offset) & bitfield_mask(format->b.length), format->b.length),
+        .a = format->a.length == 0 ? 255 : bitfield_to_u8((pixel >> format->a.offset) & bitfield_mask(format->a.length), format->a.length),
+    };
+
+    return rgba;
+}
+
+static inline uint32_t pack_fbdev_pixel(struct rgba8 rgba, const struct fbdev_pixfmt *format) {
+    uint32_t pixel;
+
+    pixel = 0;
+    pixel |= u8_to_bitfield(rgba.r, format->r.length) << format->r.offset;
+    pixel |= u8_to_bitfield(rgba.g, format->g.length) << format->g.offset;
+    pixel |= u8_to_bitfield(rgba.b, format->b.length) << format->b.offset;
+    pixel |= u8_to_bitfield(rgba.a, format->a.length) << format->a.offset;
+    return pixel;
+}
 
 static void fbdev_mirror_try_init(void) {
     struct fb_fix_screeninfo fix;
@@ -103,12 +235,20 @@ static void fbdev_mirror_try_init(void) {
     const char *path;
     void *map;
     size_t map_size;
+    size_t bytes_per_pixel;
+    size_t base_offset;
+    size_t required_size;
+    uint64_t used_bits;
     int fd;
 
-    if (g_fbdev_mirror.initialized) {
+    if (g_fbdev_mirror.enabled) {
         return;
     }
-    g_fbdev_mirror.initialized = true;
+
+    if (g_fbdev_mirror.retry_after_frames != 0) {
+        g_fbdev_mirror.retry_after_frames -= 1;
+        return;
+    }
 
     path = getenv("FLUTTER_PI_FBDEV_MIRROR");
     if (path == NULL || *path == '\0') {
@@ -118,6 +258,7 @@ static void fbdev_mirror_try_init(void) {
     fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         LOG_ERROR("Couldn't open fbdev mirror target %s. open: %s\n", path, strerror(errno));
+        g_fbdev_mirror.retry_after_frames = 120;
         return;
     }
 
@@ -127,26 +268,100 @@ static void fbdev_mirror_try_init(void) {
     if (ioctl(fd, FBIOGET_FSCREENINFO, &fix) != 0) {
         LOG_ERROR("Couldn't query fbdev fixed screen info for %s. ioctl(FBIOGET_FSCREENINFO): %s\n", path, strerror(errno));
         close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
         return;
     }
 
     if (ioctl(fd, FBIOGET_VSCREENINFO, &var) != 0) {
         LOG_ERROR("Couldn't query fbdev variable screen info for %s. ioctl(FBIOGET_VSCREENINFO): %s\n", path, strerror(errno));
         close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
         return;
     }
 
-    if (var.bits_per_pixel != 16) {
-        LOG_ERROR("fbdev mirror target %s uses unsupported bits_per_pixel %u. Expected RGB565.\n", path, var.bits_per_pixel);
+    if (fix.type != FB_TYPE_PACKED_PIXELS) {
+        LOG_ERROR("fbdev mirror target %s uses unsupported framebuffer type %u. Expected packed pixels.\n", path, fix.type);
         close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
+        return;
+    }
+
+    if (fix.visual != FB_VISUAL_TRUECOLOR && fix.visual != FB_VISUAL_DIRECTCOLOR) {
+        LOG_ERROR(
+            "fbdev mirror target %s uses unsupported framebuffer visual %u. Expected truecolor or directcolor.\n",
+            path,
+            fix.visual
+        );
+        close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
+        return;
+    }
+
+    if (var.bits_per_pixel == 0 || var.bits_per_pixel > 32) {
+        LOG_ERROR(
+            "fbdev mirror target %s uses unsupported bits_per_pixel %u. Expected a packed truecolor/directcolor format up to 32bpp.\n",
+            path,
+            var.bits_per_pixel
+        );
+        close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
+        return;
+    }
+
+    used_bits = 0;
+    if (!fbdev_mirror_validate_bitfield(path, "red", var.red, var.bits_per_pixel, &used_bits, true) ||
+        !fbdev_mirror_validate_bitfield(path, "green", var.green, var.bits_per_pixel, &used_bits, true) ||
+        !fbdev_mirror_validate_bitfield(path, "blue", var.blue, var.bits_per_pixel, &used_bits, true) ||
+        !fbdev_mirror_validate_bitfield(path, "alpha", var.transp, var.bits_per_pixel, &used_bits, false)) {
+        close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
+        return;
+    }
+
+    if (var.xres == 0 || var.yres == 0) {
+        LOG_ERROR("fbdev mirror target %s reports invalid visible size %ux%u.\n", path, var.xres, var.yres);
+        close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
         return;
     }
 
     map_size = fix.smem_len != 0 ? fix.smem_len : ((size_t) fix.line_length * var.yres_virtual);
+    bytes_per_pixel = ((size_t) var.bits_per_pixel + 7) / 8;
+    base_offset = ((size_t) var.yoffset * fix.line_length) + ((size_t) var.xoffset * bytes_per_pixel);
+    required_size = base_offset + ((size_t) var.yres * fix.line_length);
+
+    if (fix.line_length < ((size_t) var.xoffset + var.xres) * bytes_per_pixel) {
+        LOG_ERROR(
+            "fbdev mirror target %s reports an invalid line length %u for visible range %u..%u at %zu bytes per pixel.\n",
+            path,
+            fix.line_length,
+            var.xoffset,
+            var.xoffset + var.xres,
+            bytes_per_pixel
+        );
+        close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
+        return;
+    }
+
+    if (base_offset > map_size || required_size > map_size) {
+        LOG_ERROR(
+            "fbdev mirror target %s reports an invalid visible buffer range (offset=%zu, required=%zu, map=%zu).\n",
+            path,
+            base_offset,
+            required_size,
+            map_size
+        );
+        close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
+        return;
+    }
+
     map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
         LOG_ERROR("Couldn't mmap fbdev mirror target %s. mmap: %s\n", path, strerror(errno));
         close(fd);
+        g_fbdev_mirror.retry_after_frames = 120;
         return;
     }
 
@@ -156,7 +371,21 @@ static void fbdev_mirror_try_init(void) {
     g_fbdev_mirror.width = var.xres;
     g_fbdev_mirror.height = var.yres;
     g_fbdev_mirror.stride = fix.line_length;
+    g_fbdev_mirror.bytes_per_pixel = (uint32_t) bytes_per_pixel;
+    g_fbdev_mirror.base_offset = base_offset;
+    g_fbdev_mirror.target_format = (struct fbdev_pixfmt) {
+        .r = var.red,
+        .g = var.green,
+        .b = var.blue,
+        .a = var.transp,
+    };
+    g_fbdev_mirror.has_target_pixfmt = has_pixfmt_for_fbdev_format(var.bits_per_pixel, var.red, var.green, var.blue, var.transp);
+    g_fbdev_mirror.target_pixfmt = g_fbdev_mirror.has_target_pixfmt
+        ? get_pixfmt_for_fbdev_format(var.bits_per_pixel, var.red, var.green, var.blue, var.transp)
+        : PIXFMT_RGB565;
     g_fbdev_mirror.enabled = true;
+    g_fbdev_mirror.retry_after_frames = 0;
+    g_fbdev_mirror.logged_size_mismatch = false;
 }
 
 static inline uint16_t xrgb8888_to_rgb565(uint32_t pixel) {
@@ -169,6 +398,9 @@ static inline uint16_t xrgb8888_to_rgb565(uint32_t pixel) {
 static void fbdev_mirror_present_bo(struct gbm_bo *bo) {
     uint32_t width, height, format, src_stride;
     uint64_t modifier;
+    const struct pixfmt_info *src_info;
+    uint8_t *dst_base;
+    enum pixfmt src_pixfmt;
     uint8_t *src;
     void *map_data;
 
@@ -190,25 +422,30 @@ static void fbdev_mirror_present_bo(struct gbm_bo *bo) {
         return;
     }
 
-    if (format != GBM_FORMAT_XRGB8888 && format != GBM_FORMAT_ARGB8888 && format != GBM_FORMAT_RGB565) {
+    if (!has_pixfmt_for_gbm_format(format)) {
         if (!g_fbdev_mirror.logged_unsupported_format) {
-            LOG_ERROR("fbdev mirror only supports XRGB8888/ARGB8888/RGB565 GBM BOs, got format 0x%x\n", format);
+            LOG_ERROR("fbdev mirror doesn't support GBM BO format 0x%x\n", format);
             g_fbdev_mirror.logged_unsupported_format = true;
         }
         return;
     }
+    src_pixfmt = get_pixfmt_for_gbm_format(format);
+    src_info = get_pixfmt_info(src_pixfmt);
 
     if (width != g_fbdev_mirror.width || height != g_fbdev_mirror.height) {
-        LOG_ERROR(
-            "fbdev mirror target size doesn't match render surface (%ux%u != %ux%u).\n",
-            g_fbdev_mirror.width,
-            g_fbdev_mirror.height,
-            width,
-            height
-        );
-        g_fbdev_mirror.enabled = false;
+        if (!g_fbdev_mirror.logged_size_mismatch) {
+            LOG_ERROR(
+                "fbdev mirror target size doesn't match render surface (%ux%u != %ux%u).\n",
+                g_fbdev_mirror.width,
+                g_fbdev_mirror.height,
+                width,
+                height
+            );
+            g_fbdev_mirror.logged_size_mismatch = true;
+        }
         return;
     }
+    g_fbdev_mirror.logged_size_mismatch = false;
 
     map_data = NULL;
     src = gbm_bo_map(bo, 0, 0, width, height, GBM_BO_TRANSFER_READ, &src_stride, &map_data);
@@ -217,18 +454,37 @@ static void fbdev_mirror_present_bo(struct gbm_bo *bo) {
         return;
     }
 
+    dst_base = g_fbdev_mirror.map + g_fbdev_mirror.base_offset;
     for (uint32_t y = 0; y < height; y++) {
         const uint8_t *src_row_bytes = src + ((size_t) y * src_stride);
-        uint16_t *dst_row = (uint16_t *) (g_fbdev_mirror.map + ((size_t) y * g_fbdev_mirror.stride));
+        uint8_t *dst_row = (uint8_t *) (dst_base + ((size_t) y * g_fbdev_mirror.stride));
 
-        if (format == GBM_FORMAT_RGB565) {
-            memcpy(dst_row, src_row_bytes, (size_t) width * 2);
+        if (g_fbdev_mirror.has_target_pixfmt && src_pixfmt == g_fbdev_mirror.target_pixfmt) {
+            memcpy(dst_row, src_row_bytes, (size_t) width * g_fbdev_mirror.bytes_per_pixel);
             continue;
         }
 
-        const uint32_t *src_row = (const uint32_t *) src_row_bytes;
+        if (g_fbdev_mirror.has_target_pixfmt &&
+            g_fbdev_mirror.target_pixfmt == PIXFMT_RGB565 &&
+            (src_pixfmt == PIXFMT_XRGB8888 || src_pixfmt == PIXFMT_ARGB8888)) {
+            uint16_t *dst_row_rgb565 = (uint16_t *) dst_row;
+            const uint32_t *src_row_xrgb = (const uint32_t *) src_row_bytes;
+
+            for (uint32_t x = 0; x < width; x++) {
+                dst_row_rgb565[x] = xrgb8888_to_rgb565(src_row_xrgb[x]);
+            }
+            continue;
+        }
+
         for (uint32_t x = 0; x < width; x++) {
-            dst_row[x] = xrgb8888_to_rgb565(src_row[x]);
+            struct rgba8 rgba;
+            uint32_t src_pixel;
+            uint32_t dst_pixel;
+
+            src_pixel = read_packed_pixel(src_row_bytes + ((size_t) x * (src_info->bits_per_pixel / 8)), src_info->bits_per_pixel / 8);
+            rgba = unpack_pixfmt_pixel(src_pixel, &src_info->fbdev_format);
+            dst_pixel = pack_fbdev_pixel(rgba, &g_fbdev_mirror.target_format);
+            write_packed_pixel(dst_row + ((size_t) x * g_fbdev_mirror.bytes_per_pixel), g_fbdev_mirror.bytes_per_pixel, dst_pixel);
         }
     }
 

@@ -374,6 +374,63 @@ ATTR_CONST static inline const struct pixfmt_info *get_pixfmt_info(enum pixfmt f
     return pixfmt_infos + format;
 }
 
+#ifdef HAVE_FBDEV
+ATTR_CONST static inline bool fb_bitfield_equals(struct fb_bitfield lhs, struct fb_bitfield rhs) {
+    return lhs.length == rhs.length && lhs.offset == rhs.offset && lhs.msb_right == rhs.msb_right;
+}
+
+ATTR_CONST static inline bool has_pixfmt_for_fbdev_format(
+    uint32_t bits_per_pixel,
+    struct fb_bitfield red,
+    struct fb_bitfield green,
+    struct fb_bitfield blue,
+    struct fb_bitfield transp
+) {
+    for (int i = 0; i < n_pixfmt_infos; i++) {
+        const struct pixfmt_info *info = get_pixfmt_info(i);
+
+        if (info->bits_per_pixel != (int) bits_per_pixel) {
+            continue;
+        }
+
+        if (fb_bitfield_equals(info->fbdev_format.r, red) &&
+            fb_bitfield_equals(info->fbdev_format.g, green) &&
+            fb_bitfield_equals(info->fbdev_format.b, blue) &&
+            fb_bitfield_equals(info->fbdev_format.a, transp)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+ATTR_CONST static inline enum pixfmt get_pixfmt_for_fbdev_format(
+    uint32_t bits_per_pixel,
+    struct fb_bitfield red,
+    struct fb_bitfield green,
+    struct fb_bitfield blue,
+    struct fb_bitfield transp
+) {
+    for (int i = 0; i < n_pixfmt_infos; i++) {
+        const struct pixfmt_info *info = get_pixfmt_info(i);
+
+        if (info->bits_per_pixel != (int) bits_per_pixel) {
+            continue;
+        }
+
+        if (fb_bitfield_equals(info->fbdev_format.r, red) &&
+            fb_bitfield_equals(info->fbdev_format.g, green) &&
+            fb_bitfield_equals(info->fbdev_format.b, blue) &&
+            fb_bitfield_equals(info->fbdev_format.a, transp)) {
+            return i;
+        }
+    }
+
+    ASSERT_MSG(false, "Check has_pixfmt_for_fbdev_format if an enum pixfmt exists for a specific fbdev format.");
+    return PIXFMT_RGB565;
+}
+#endif
+
 ATTR_CONST static inline bool has_pixfmt_for_drm_format(uint32_t fourcc) {
     for (int i = 0; i < n_pixfmt_infos; i++) {
         if (get_pixfmt_info(i)->drm_format == fourcc) {
