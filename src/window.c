@@ -1719,6 +1719,15 @@ static struct render_surface *dummy_window_get_render_surface_internal(struct wi
         #error "EGL header definitions for extension EGL_KHR_no_config_context are required."
     #endif
 
+        const uint64_t linear_modifier = DRM_FORMAT_MOD_LINEAR;
+        const uint64_t *allowed_modifiers = NULL;
+        size_t n_allowed_modifiers = 0;
+
+        if (getenv("FLUTTER_PI_DUMMY_LINEAR") != NULL) {
+            allowed_modifiers = &linear_modifier;
+            n_allowed_modifiers = 1;
+        }
+
         struct egl_gbm_render_surface *egl_surface = egl_gbm_render_surface_new_with_egl_config(
             window->tracer,
             size,
@@ -1726,8 +1735,8 @@ static struct render_surface *dummy_window_get_render_surface_internal(struct wi
             window->gl_renderer,
             window->has_forced_pixel_format ? window->forced_pixel_format : PIXFMT_ARGB8888,
             EGL_NO_CONFIG_KHR,
-            NULL,
-            0
+            allowed_modifiers,
+            n_allowed_modifiers
         );
         if (egl_surface == NULL) {
             LOG_ERROR("Couldn't create EGL GBM rendering surface.\n");
