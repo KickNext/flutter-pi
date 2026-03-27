@@ -11,7 +11,13 @@
 #include "egl_gbm_render_surface.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/fb.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "egl.h"
 #include "gl_renderer.h"
@@ -73,6 +79,161 @@ static const uuid_t uuid = CONST_UUID(0xf9, 0xc2, 0x5d, 0xad, 0x2e, 0x3b, 0x4e, 
 
 #define CAST_THIS(ptr) CAST_EGL_GBM_RENDER_SURFACE(ptr)
 #define CAST_THIS_UNCHECKED(ptr) CAST_EGL_GBM_RENDER_SURFACE_UNCHECKED(ptr)
+
+struct fbdev_mirror {
+    bool initialized;
+    bool enabled;
+    bool logged_unsupported_format;
+    bool logged_unsupported_modifier;
+    int fd;
+    uint8_t *map;
+    size_t map_size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+};
+
+static struct fbdev_mirror g_fbdev_mirror = {
+    .fd = -1,
+};
+
+static void fbdev_mirror_try_init(void) {
+    struct fb_fix_screeninfo fix;
+    struct fb_var_screeninfo var;
+    const char *path;
+    void *map;
+    size_t map_size;
+    int fd;
+
+    if (g_fbdev_mirror.initialized) {
+        return;
+    }
+    g_fbdev_mirror.initialized = true;
+
+    path = getenv("FLUTTER_PI_FBDEV_MIRROR");
+    if (path == NULL || *path == '\0') {
+        return;
+    }
+
+    fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        LOG_ERROR("Couldn't open fbdev mirror target %s. open: %s\n", path, strerror(errno));
+        return;
+    }
+
+    memset(&fix, 0, sizeof fix);
+    memset(&var, 0, sizeof var);
+
+    if (ioctl(fd, FBIOGET_FSCREENINFO, &fix) != 0) {
+        LOG_ERROR("Couldn't query fbdev fixed screen info for %s. ioctl(FBIOGET_FSCREENINFO): %s\n", path, strerror(errno));
+        close(fd);
+        return;
+    }
+
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &var) != 0) {
+        LOG_ERROR("Couldn't query fbdev variable screen info for %s. ioctl(FBIOGET_VSCREENINFO): %s\n", path, strerror(errno));
+        close(fd);
+        return;
+    }
+
+    if (var.bits_per_pixel != 16) {
+        LOG_ERROR("fbdev mirror target %s uses unsupported bits_per_pixel %u. Expected RGB565.\n", path, var.bits_per_pixel);
+        close(fd);
+        return;
+    }
+
+    map_size = fix.smem_len != 0 ? fix.smem_len : ((size_t) fix.line_length * var.yres_virtual);
+    map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        LOG_ERROR("Couldn't mmap fbdev mirror target %s. mmap: %s\n", path, strerror(errno));
+        close(fd);
+        return;
+    }
+
+    g_fbdev_mirror.fd = fd;
+    g_fbdev_mirror.map = map;
+    g_fbdev_mirror.map_size = map_size;
+    g_fbdev_mirror.width = var.xres;
+    g_fbdev_mirror.height = var.yres;
+    g_fbdev_mirror.stride = fix.line_length;
+    g_fbdev_mirror.enabled = true;
+}
+
+static inline uint16_t xrgb8888_to_rgb565(uint32_t pixel) {
+    uint8_t b = pixel & 0xFF;
+    uint8_t g = (pixel >> 8) & 0xFF;
+    uint8_t r = (pixel >> 16) & 0xFF;
+    return (uint16_t) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+static void fbdev_mirror_present_bo(struct gbm_bo *bo) {
+    uint32_t width, height, format, src_stride;
+    uint64_t modifier;
+    uint8_t *src;
+    void *map_data;
+
+    fbdev_mirror_try_init();
+    if (!g_fbdev_mirror.enabled) {
+        return;
+    }
+
+    width = gbm_bo_get_width(bo);
+    height = gbm_bo_get_height(bo);
+    format = gbm_bo_get_format(bo);
+    modifier = gbm_bo_get_modifier(bo);
+
+    if (modifier != DRM_FORMAT_MOD_LINEAR) {
+        if (!g_fbdev_mirror.logged_unsupported_modifier) {
+            LOG_ERROR("fbdev mirror only supports linear GBM BOs, got modifier 0x%" PRIx64 "\n", modifier);
+            g_fbdev_mirror.logged_unsupported_modifier = true;
+        }
+        return;
+    }
+
+    if (format != GBM_FORMAT_XRGB8888 && format != GBM_FORMAT_ARGB8888 && format != GBM_FORMAT_RGB565) {
+        if (!g_fbdev_mirror.logged_unsupported_format) {
+            LOG_ERROR("fbdev mirror only supports XRGB8888/ARGB8888/RGB565 GBM BOs, got format 0x%x\n", format);
+            g_fbdev_mirror.logged_unsupported_format = true;
+        }
+        return;
+    }
+
+    if (width != g_fbdev_mirror.width || height != g_fbdev_mirror.height) {
+        LOG_ERROR(
+            "fbdev mirror target size doesn't match render surface (%ux%u != %ux%u).\n",
+            g_fbdev_mirror.width,
+            g_fbdev_mirror.height,
+            width,
+            height
+        );
+        g_fbdev_mirror.enabled = false;
+        return;
+    }
+
+    map_data = NULL;
+    src = gbm_bo_map(bo, 0, 0, width, height, GBM_BO_TRANSFER_READ, &src_stride, &map_data);
+    if (src == NULL) {
+        LOG_ERROR("Couldn't map GBM BO for fbdev mirroring. gbm_bo_map: %s\n", strerror(errno));
+        return;
+    }
+
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *src_row_bytes = src + ((size_t) y * src_stride);
+        uint16_t *dst_row = (uint16_t *) (g_fbdev_mirror.map + ((size_t) y * g_fbdev_mirror.stride));
+
+        if (format == GBM_FORMAT_RGB565) {
+            memcpy(dst_row, src_row_bytes, (size_t) width * 2);
+            continue;
+        }
+
+        const uint32_t *src_row = (const uint32_t *) src_row_bytes;
+        for (uint32_t x = 0; x < width; x++) {
+            dst_row[x] = xrgb8888_to_rgb565(src_row[x]);
+        }
+    }
+
+    gbm_bo_unmap(bo, map_data);
+}
 
 static void locked_fb_destroy(struct locked_fb *fb) {
     struct egl_gbm_render_surface *s;
@@ -748,6 +909,7 @@ locked:
     egl_surface->locked_fbs[i].surface = CAST_THIS(surface_ref(CAST_SURFACE(s)));
     egl_surface->locked_fbs[i].n_refs = REFCOUNT_INIT_1;
     egl_surface->locked_front_fb = egl_surface->locked_fbs + i;
+    fbdev_mirror_present_bo(bo);
     surface_unlock(CAST_SURFACE(s));
     return 0;
 
